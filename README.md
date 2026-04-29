@@ -53,24 +53,31 @@ You will need to download the UMLS version to run this method. For instance, to 
 
 ## Train and evaluate a model
 
-Our method is composed of two steps:
+Our method is composed of three steps:
+
+- Terminology preparation, to materialize the filtered UMLS rows as parquet fragments
+  that EDS-NLP can read in parallel:
+
+    ```bash
+    python -m mlg_norm.train prepare_terminology --config configs/config.yml
+    ```
 
 - Pre-training, to learn multilingual representations and produce similar representation for synonyms of a same concept:
 
     ```bash
-    python scripts/train.py pretrain --config configs/config.cfg
+    python -m mlg_norm.train pretrain --config configs/config.yml
     ```
 
 - Short classifier training. This will probe the pre-trained embedding and finetune the concepts weights.
 
     ```bash
-    python scripts/train.py train_classifier --config configs/config.cfg
+    python -m mlg_norm.train train_classifier --config configs/config.yml
     ```
 
 Finally, you can evaluate the model:
 
 ```bash
-python scripts/evaluate.py evaluate --config configs/config.cfg
+python -m mlg_norm.evaluate evaluate --config configs/config.yml
 ```
 
-Consider changing the [`configs/config.cfg`](/configs/config.cfg) to fit your needs.
+Consider changing the [`configs/config.yml`](/configs/config.yml) to fit your needs.

@@ -1,10 +1,12 @@
 import json
 import os
-import random
+import shutil
 from collections import defaultdict
+from itertools import islice
 from pathlib import Path
 from typing import (
     Any,
+    Iterable,
     Optional,
     Union,
 )
@@ -13,19 +15,18 @@ import edsnlp
 import polars as pl
 import spacy.tokens
 import torch
-import torch.utils.data
-from accelerate.utils import send_to_device, gather_object
+from accelerate.utils import send_to_device
 from confit import Cli, validate_arguments
 from confit.utils.random import set_seed
+from edsnlp import registry
 from edsnlp.core.pipeline import Pipeline
-from edsnlp.optimization import LinearSchedule, ScheduledOptimizer
+from edsnlp.core.stream import Stream
 from edsnlp.pipes.trainable.span_linker.span_linker import TrainableSpanLinker
 from edsnlp.scorers import make_examples
 from edsnlp.scorers.span_classification import span_classification_scorer
 from edsnlp.training.loggers import flatten_dict
 from edsnlp.training.trainer import ScheduledOptimizer
 from edsnlp.utils.bindings import BINDING_SETTERS
-from edsnlp.utils.collections import batchify, ld_to_dl, decompress_dict, batch_compress_dict
 from edsnlp.utils.span_getters import get_spans
 from rich_logger import RichTablePrinter
 from tqdm import tqdm, trange
@@ -153,6 +154,10 @@ def load_wiki(
 
 
 def convert(entry, tokenizer=None):
+    if tokenizer is None:
+        tokenizer = edsnlp.blank("eds").tokenizer
+    if not spacy.tokens.Span.has_extension("cui"):
+        spacy.tokens.Span.set_extension("cui", default=None)
     doc = tokenizer(entry["STR"].lower()[:100].strip())
     span = spacy.tokens.Span(
         doc,
@@ -163,6 +168,48 @@ def convert(entry, tokenizer=None):
     span._.cui = entry["CUI"]
     doc.spans["entities"] = [span]
     return doc
+
+
+@registry.factory.register("mlg_norm.synonym_dict2doc", spacy_compatible=False)
+def create_synonym_dict2doc_converter(tokenizer=None):
+    return lambda entry: convert(entry, tokenizer=tokenizer)
+
+
+def ensure_training_stream(train_data: Any) -> Stream:
+    if train_data is None:
+        raise ValueError(
+            "train_data is required. Define it in the config with an EDS-NLP reader, "
+            "for example '@readers: parquet'."
+        )
+    if isinstance(train_data, Stream):
+        return train_data
+    return edsnlp.data.from_iterable(train_data)
+
+
+def iter_preprocessed_batches(
+    data,
+    *,
+    nlp: Pipeline,
+    batch_size: int,
+    device: torch.device,
+    num_workers: int,
+    shuffle: Union[str, bool] = "fragment",
+    show_progress: bool = False,
+) -> Iterable[Any]:
+    stream = data.loop()
+    if shuffle and not getattr(stream.reader, "shuffle", False):
+        stream = stream.shuffle(shuffle)
+    stream = (
+        stream.map(nlp.preprocess, kwargs=dict(compress=True, supervision=True))
+        .batchify(batch_size=batch_size)
+        .map(nlp.collate, kwargs=dict(device=device))
+        .set_processing(
+            num_cpu_workers=num_workers,
+            show_progress=show_progress,
+            process_start_method="spawn" if num_workers else None,
+        )
+    )
+    yield from stream
 
 
 def evaluate_model(nlp, docs):
@@ -180,25 +227,96 @@ def evaluate_model(nlp, docs):
     )
 
 
-@app.command(name="pretrain")
+@app.command(name="prepare_terminology")
+def prepare_terminology(
+    *,
+    output_path: Optional[Path] = None,
+    umls_path: Optional[Path] = None,
+    wiki_path: Optional[Path] = None,
+    query: Optional[str] = None,
+    cui_query: Optional[str] = None,
+    secondary_query: Optional[str] = None,
+    sample: Optional[int] = None,
+    max_rows_per_file: int = 100_000,
+    compression: str = "zstd",
+    overwrite: bool = False,
+    datasets: Optional[list[dict[str, Any]]] = None,
+):
+    """
+    Prepare terminology rows as a parquet dataset that EDS-NLP can read in parallel.
+    """
+    if datasets is not None:
+        for dataset in datasets:
+            params = {
+                "max_rows_per_file": max_rows_per_file,
+                "compression": compression,
+                "overwrite": overwrite,
+                **dataset,
+            }
+            prepare_terminology(**params)
+        return
+
+    if output_path is None:
+        raise ValueError("output_path is required when datasets is not provided.")
+    if query is None:
+        raise ValueError("query is required when datasets is not provided.")
+
+    output_path = Path(output_path)
+    if output_path.exists():
+        parquet_files = list(output_path.rglob("*.parquet")) if output_path.is_dir() else []
+        if parquet_files or output_path.is_file():
+            if not overwrite:
+                raise FileExistsError(
+                    f"{output_path} already contains parquet data. "
+                    "Set overwrite=true to replace it."
+                )
+            if output_path.is_dir():
+                shutil.rmtree(output_path)
+            else:
+                output_path.unlink()
+
+    if umls_path is not None:
+        synonyms = load_umls(
+            umls_path,
+            query=query,
+            cui_query=cui_query,
+            secondary_query=secondary_query,
+        )
+    else:
+        synonyms = load_wiki(
+            wiki_path,
+            query=query,
+            cui_query=cui_query,
+            secondary_query=secondary_query,
+            sample=sample,
+        )
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    print(f"Writing terminology parquet dataset to {output_path}")
+    synonyms.sink_parquet(
+        pl.PartitionBy(output_path, max_rows_per_file=max_rows_per_file),
+        compression=compression,
+        mkdir=True,
+    )
+
+
+@app.command(name="pretrain", registry=registry)
 def pretrain(
     *,
     nlp: Pipeline,
     seed: int = 42,
     max_steps: int = 20000,
     val_docs: Any,
+    train_data: Any,
     transformer_lr: float = 5e-5,
     task_lr: float = 1e-4,
     batch_size: int = 512,
+    num_workers: int = 4,
+    shuffle: Union[str, bool] = "fragment",
     validation_interval: Optional[int] = None,
     max_grad_norm: float = 10.0,
-    sample: Optional[int] = None,
     warmup_rate: float = 0.1,
     output_dir: Path = "artifacts/model-inter",
-    umls_path: Optional[Path] = None,
-    wiki_path: Optional[Path] = None,
-    query: str,
-    cui_query: Optional[str] = None,
     cpu: bool = False,
     dropout: float = 0.2,
     debug: bool = False,
@@ -220,6 +338,9 @@ def pretrain(
         The maximum number of steps to train the model.
     val_docs : Any
         The validation documents.
+    train_data : Any
+        The training stream, typically defined in config with the EDS-NLP parquet
+        reader.
     transformer_lr : float
         The learning rate for the transformer, set to 0 to freeze the transformer.
     task_lr : float
@@ -237,18 +358,6 @@ def pretrain(
         The scorer to use.
     output_dir : Path
         The output directory.
-    umls_path : Path
-        The path to the UMLS data. Expects the following files:
-
-        - MRCONSO.RRF
-        - MRSTY.RRF
-        - sty_groups.tsv
-    wiki_path : Path
-        The path to the Wikipedia synonyms data.
-    query : str
-        The polars query to filter the UMLS synonyms.
-    cui_query : Optional[str]
-        The polars query to filter the CUIs in the retrieved synonyms.
     cpu : bool
         Whether to force the use of the CPU (can be useful for debugging).
     dropout : float
@@ -257,15 +366,6 @@ def pretrain(
         Whether to run in debug mode (max_steps = 500, limit synonyms = 10000).
     """
     print("Start pre-training entity linker")
-    def make_batches(prep, nlp, batch_size, device):
-        while True:
-            shuffled = list(prep)
-            random.shuffle(shuffled)
-            for batch in batchify(shuffled, batch_size):
-                batch = nlp.collate(batch)
-                batch = send_to_device(batch, device)
-                yield batch
-
     output_dir = Path(output_dir)
     train_metrics_path = output_dir / "train_metrics.json"
     device = torch.device("cuda" if not cpu and torch.cuda.is_available() else "cpu")
@@ -278,55 +378,41 @@ def pretrain(
         if isinstance(module, torch.nn.Dropout):
             module.p = dropout
 
-    # ------ Prepare the data ------
-    if umls_path is not None:
-        synonyms = load_umls(
-            umls_path,
-            query=query,
-            cui_query=cui_query,
-        )
-    else:
-        synonyms = load_wiki(
-            wiki_path,
-            query=query,
-            cui_query=cui_query,
-            sample=sample,
-        )
+    train_data = ensure_training_stream(train_data)
     if debug:
         max_steps = 500
-        synonyms = synonyms.limit(1000).collect().lazy()
+        train_data = edsnlp.data.from_iterable(list(islice(train_data, 1000)))
 
     # Preprocessing training data
-    print("Preprocessing synonyms")
+    print("Post-initializing linker")
     nlp.to(device)
     nlp.post_init(
-        edsnlp.data.from_polars(
-            synonyms, converter=convert, tokenizer=nlp.tokenizer
-        ).set_processing(backend="multiprocessing", show_progress=True, batch_size=1024)
+        train_data.set_processing(
+            num_cpu_workers=num_workers,
+            show_progress=True,
+            process_start_method="spawn" if num_workers else None,
+        )
     )
     nlp.train(True)
 
-    prep = list(
-        edsnlp.data.from_polars(synonyms, converter=convert, tokenizer=nlp.tokenizer)
-        .set_processing(backend="multiprocessing", show_progress=True, batch_size=1024)
-        .map(nlp.preprocess, kwargs=dict(compress=True, supervision=True))
+    batch_iterator = iter(
+        iter_preprocessed_batches(
+            train_data,
+            nlp=nlp,
+            batch_size=batch_size,
+            device=device,
+            num_workers=num_workers,
+            shuffle=shuffle,
+        )
     )
-    random.shuffle(prep)
 
     print("Stats")
     print("- Groups:", len(linker.span_labels_to_idx))
     print("- Concepts:", len(linker.concepts_to_idx))
-    print("- Synonyms:", len(prep))
     assert len(linker.span_labels_to_idx) > 0
     assert len(linker.concepts_to_idx) > 0
-    assert len(prep) > 0
 
     # Optimizer
-    params = set(linker.parameters())
-    trf_pipe = linker.embedding
-    trf_params = params & set(trf_pipe.parameters() if trf_pipe else ())
-    batch_iterator = iter(make_batches(prep, nlp, batch_size, device))
-
     optim = ScheduledOptimizer(
         optim=torch.optim.AdamW,
         module=nlp,
@@ -336,10 +422,20 @@ def pretrain(
                 "weight_decay": 0,
             },
             "linker[.]embedding[.]embedding": {
-                "lr": {"@schedules": "linear", "warmup_rate": warmup_rate, "start_value": 0, "max_value": transformer_lr,},
+                "lr": {
+                    "@schedules": "linear",
+                    "warmup_rate": warmup_rate,
+                    "start_value": 0,
+                    "max_value": transformer_lr,
+                },
             } if transformer_lr > 0 else False,
             "": {
-                "lr": {"@schedules": "linear", "warmup_rate": warmup_rate, "start_value": task_lr, "max_value": task_lr,},
+                "lr": {
+                    "@schedules": "linear",
+                    "warmup_rate": warmup_rate,
+                    "start_value": task_lr,
+                    "max_value": task_lr,
+                },
             },
         },
     )
@@ -397,7 +493,7 @@ def pretrain(
         if step == max_steps:
             break
 
-        with SliceContext(optim) as slice_context:
+        with SliceContext(optim):
             optim.zero_grad()
             mini_batch = next(batch_iterator)
             mini_batch = send_to_device(mini_batch, device)
@@ -409,7 +505,9 @@ def pretrain(
                 if "loss" in res:
                     loss += res["loss"]
                 for key, value in res.items():
-                    if isinstance(value, (float, int)) or isinstance(value, torch.Tensor) and value.numel() == 1:
+                    if isinstance(value, (float, int)) or (
+                        isinstance(value, torch.Tensor) and value.numel() == 1
+                    ):
                         cumulated_data[key] += float(value)
                 if torch.isnan(loss):
                     raise ValueError("NaN loss")
@@ -424,22 +522,20 @@ def pretrain(
 
 
 # noinspection PyTypeHints
-@app.command(name="train_classifier")
+@app.command(name="train_classifier", registry=registry)
 def train_classifier(
     *,
     nlp: Union[Path, Pipeline],
     seed: int = 42,
     max_steps: int = 10000,
     val_docs: Any,
+    train_data: Any,
     task_lr: float = 1e-4,
     batch_size: int = 4,
+    num_workers: int = 4,
     training_top_k: int = 200,
     validation_interval: Optional[int] = None,
     warmup_rate: float = 0.1,
-    umls_path: Optional[Path] = None,
-    wiki_path: Optional[Path] = None,
-    query: str,
-    cui_query: Optional[str] = None,
     cpu: bool = False,
     mode: str = None,
     output_dir: Optional[Path] = "artifacts/model-last",
@@ -465,6 +561,9 @@ def train_classifier(
         The maximum number of steps to train the model.
     val_docs : Any
         The validation documents.
+    train_data : Any
+        The training stream, typically defined in config with the EDS-NLP parquet
+        reader.
     task_lr : float
         The learning rate for the non-transformer parts of the model.
     batch_size : int
@@ -477,18 +576,6 @@ def train_classifier(
         The warmup rate for the transformer learning rate schedules.
     scorer : GenericScorer
         The scorer to use.
-    umls_path : Path
-        The path to the UMLS data. Expects the following files:
-
-        - MRCONSO.RRF
-        - MRSTY.RRF
-        - sty_groups.tsv
-    wiki_path : Path
-        The path to the Wikipedia synonyms data.
-    query : str
-        The polars query to filter the UMLS synonyms.
-    cui_query : Optional[str]
-        The polars query to filter the CUIs in the retrieved synonyms.
     cpu : bool
         Whether to force the use of the CPU (can be useful for debugging).
     mode : str
@@ -549,32 +636,20 @@ def train_classifier(
     set_seed(seed)
     nlp.to(device).train(False)
 
-    # ------ Prepare the data ------
-    if umls_path is not None:
-        synonyms = load_umls(
-            umls_path,
-            query=query,
-            cui_query=cui_query,
-        )
-    else:
-        synonyms = load_wiki(
-            wiki_path,
-            query=query,
-            cui_query=cui_query,
-        )
+    train_data = ensure_training_stream(train_data)
     if debug:
         max_steps = 500
-        synonyms = synonyms.limit(10000).collect().lazy()
+        train_data = edsnlp.data.from_iterable(list(islice(train_data, 10000)))
 
     # Preprocessing training data
     print("Preprocessing data")
 
     if not os.path.exists("cached_features.pt") or not enable_features_caching:
         all_concepts, all_labels, all_embeds = linker.compute_init_features(
-            edsnlp.data.from_polars(
-                synonyms, converter=convert, tokenizer=nlp.tokenizer
-            ).set_processing(
-                backend="multiprocessing", show_progress=True, batch_size=4096
+            train_data.set_processing(
+                num_cpu_workers=num_workers,
+                show_progress=True,
+                process_start_method="spawn" if num_workers else None,
             ),
             with_embeddings=True,
         )
@@ -670,7 +745,12 @@ def train_classifier(
             },
             "linker[.]embedding[.]": False,
             "": {
-                "lr": {"@schedules": "linear", "warmup_rate": warmup_rate, "start_value": task_lr, "max_value": task_lr,},
+                "lr": {
+                    "@schedules": "linear",
+                    "warmup_rate": warmup_rate,
+                    "start_value": task_lr,
+                    "max_value": task_lr,
+                },
             },
         },
     )

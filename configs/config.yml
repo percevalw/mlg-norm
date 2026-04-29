@@ -1,0 +1,103 @@
+vars:
+  pretrain_terminology_path: data/terminology-pretrain
+  classifier_terminology_path: data/terminology-classifier
+  val_docs_path: data/dataset/train
+  pretrain_umls_path: data/umls/2014AB
+  classifier_umls_path: data/umls/2022AA
+
+nlp:
+  "@core": pipeline
+  lang: eds
+  components:
+    linker:
+      "@factory": eds.span_linker
+      rescale: 20
+      metric: cosine
+      threshold: 0.
+      reference_mode: concept
+      probability_mode: sigmoid
+      init_weights: true
+      embedding:
+        "@factory": eds.span_pooler
+        span_getter: entities
+        pooling_mode: mean
+        hidden_size: 350
+        embedding:
+          "@factory": eds.transformer
+          span_getter: entities
+          model: bert-base-multilingual-uncased
+          # model: microsoft/mdeberta-v3-base
+
+val_docs:
+  "@readers": standoff
+  path: ${vars.val_docs_path}
+  span_setter: entities
+  notes_as_span_attribute: cui
+  split_fragments: false
+
+pretrain_terminology:
+  "@readers": parquet
+  path: ${vars.pretrain_terminology_path}
+  work_unit: fragment
+  shuffle: fragment
+  converter:
+    "@factory": mlg_norm.synonym_dict2doc
+
+classifier_terminology:
+  "@readers": parquet
+  path: ${vars.classifier_terminology_path}
+  work_unit: fragment
+  shuffle: fragment
+  converter:
+    "@factory": mlg_norm.synonym_dict2doc
+
+prepare_terminology:
+  datasets:
+    - output_path: ${vars.pretrain_terminology_path}
+      umls_path: ${vars.pretrain_umls_path}
+      query: |
+        GRP IN ('ANAT','CHEM','DEVI','DISO','GEOG','LIVB','OBJC','PHEN','PHYS','PROC') and LAT in ('FRE', 'ENG', 'ITA', 'SPA')
+      cui_query: |
+        LAT = 'FRE'
+    - output_path: ${vars.classifier_terminology_path}
+      umls_path: ${vars.classifier_umls_path}
+      query: |
+        GRP IN ('ANAT','CHEM','DEVI','DISO','GEOG','LIVB','OBJC','PHEN','PHYS','PROC') and (LAT in ('FRE') or (LAT in ('ENG', 'ITA', 'SPA') AND SAB IN ('CHV', 'SNOMEDCT_US', 'MTH', 'NCI', 'MSH', 'MSHITA', 'MSHSPA', 'SCTSPA')))
+      cui_query: |
+        LAT = 'FRE' or LAT = 'ENG'
+  max_rows_per_file: 100000
+  overwrite: false
+
+pretrain:
+  nlp: ${nlp}
+  train_data: ${pretrain_terminology}
+  val_docs: ${val_docs}
+  dropout: 0.2
+  seed: 42
+  max_steps: 20000
+  transformer_lr: 5e-5
+  task_lr: 1e-4
+  batch_size: 512
+  num_workers: 4
+  shuffle: fragment
+  max_grad_norm: 10.0
+  warmup_rate: 0.1
+  output_dir: artifacts/model-inter
+  debug: false
+
+train_classifier:
+  nlp: artifacts/model-inter
+  train_data: ${classifier_terminology}
+  val_docs: ${val_docs}
+  seed: 42
+  task_lr: 1e-4
+  batch_size: 512
+  num_workers: 4
+  warmup_rate: 0
+  training_top_k: 200
+  output_dir: artifacts/model-last
+  max_steps: 10000
+  debug: false
+
+evaluate:
+  data: ${val_docs}
