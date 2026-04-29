@@ -14,7 +14,7 @@ import polars as pl
 import spacy.tokens
 import torch
 import torch.utils.data
-from accelerate.utils import send_to_device
+from accelerate.utils import send_to_device, gather_object
 from confit import Cli, validate_arguments
 from confit.utils.random import set_seed
 from edsnlp.core.pipeline import Pipeline
@@ -22,9 +22,10 @@ from edsnlp.optimization import LinearSchedule, ScheduledOptimizer
 from edsnlp.pipes.trainable.span_linker.span_linker import TrainableSpanLinker
 from edsnlp.scorers import make_examples
 from edsnlp.scorers.span_classification import span_classification_scorer
-from edsnlp.train import flatten_dict
+from edsnlp.training.loggers import flatten_dict
+from edsnlp.training.trainer import ScheduledOptimizer
 from edsnlp.utils.bindings import BINDING_SETTERS
-from edsnlp.utils.collections import batchify
+from edsnlp.utils.collections import batchify, ld_to_dl, decompress_dict, batch_compress_dict
 from edsnlp.utils.span_getters import get_spans
 from rich_logger import RichTablePrinter
 from tqdm import tqdm, trange
@@ -42,11 +43,11 @@ LOGGER_FIELDS = {
         "format": "{:.2e}",
         "goal_wait": 2,
     },
-    "micro/(f|p|r|ap)$": {
+    "micro/(f|p|r|ap)$|(linking_acc)": {
         "goal": "higher_is_better",
         "format": "{:.2%}",
         "goal_wait": 1,
-        "name": r"\1",
+        "name": r"\1\2",
     },
     "lr": {"format": "{:.2e}"},
     "labels": {"format": "{:.2f}"},
@@ -108,13 +109,51 @@ def load_umls(
         subsets.append(filtered.select("STR", "CUI", "GRP"))
 
     mrconso = pl.concat(subsets).with_columns(pl.col("STR").str.to_lowercase()).unique()
-    mrconso = mrconso.sort(pl.col("STR").str.n_chars(), descending=True)
+    mrconso = mrconso.sort(pl.col("STR").str.len_chars(), descending=True)
 
     return mrconso
 
 
+
+@validate_arguments
+def load_wiki(
+    path: Path,
+    query: str,
+    cui_query: Optional[str] = None,
+    secondary_query: Optional[str] = None,
+    sample: Optional[int] = None,
+) -> pl.LazyFrame:
+    mrconso = pl.scan_parquet(path)
+
+    filtered = mrconso = mrconso.with_columns(pl.lit("WIKI").alias("GRP"))
+    subsets = []
+
+    if query:
+        filtered = filtered.filter(pl.sql_expr(query))
+
+    if cui_query:
+        non_eng_cuis = filtered.filter(pl.sql_expr(cui_query)).select("CUI").unique()
+        filtered = filtered.join(non_eng_cuis, on="CUI")
+
+    subsets.append(filtered.select("STR", "CUI", "GRP"))
+
+    if secondary_query:
+        filtered = mrconso.filter(pl.sql_expr(secondary_query))
+        subsets.append(filtered.select("STR", "CUI", "GRP"))
+
+    mrconso = pl.concat(subsets).with_columns(pl.col("STR").str.to_lowercase()).unique()
+    mrconso = mrconso.sort(pl.col("STR").str.len_chars(), descending=True)
+
+    if sample is not None:
+        mrconso = mrconso.collect()
+        mrconso = mrconso.join(mrconso.select("CUI").unique().sample(sample), on="CUI")
+        mrconso = mrconso.lazy()
+    
+    return mrconso
+
+
 def convert(entry, tokenizer=None):
-    doc = tokenizer(entry["STR"].lower()[:100])
+    doc = tokenizer(entry["STR"].lower()[:100].strip())
     span = spacy.tokens.Span(
         doc,
         0,
@@ -153,9 +192,11 @@ def pretrain(
     batch_size: int = 512,
     validation_interval: Optional[int] = None,
     max_grad_norm: float = 10.0,
+    sample: Optional[int] = None,
     warmup_rate: float = 0.1,
     output_dir: Path = "artifacts/model-inter",
-    umls_path: Path,
+    umls_path: Optional[Path] = None,
+    wiki_path: Optional[Path] = None,
     query: str,
     cui_query: Optional[str] = None,
     cpu: bool = False,
@@ -202,6 +243,8 @@ def pretrain(
         - MRCONSO.RRF
         - MRSTY.RRF
         - sty_groups.tsv
+    wiki_path : Path
+        The path to the Wikipedia synonyms data.
     query : str
         The polars query to filter the UMLS synonyms.
     cui_query : Optional[str]
@@ -214,7 +257,6 @@ def pretrain(
         Whether to run in debug mode (max_steps = 500, limit synonyms = 10000).
     """
     print("Start pre-training entity linker")
-
     def make_batches(prep, nlp, batch_size, device):
         while True:
             shuffled = list(prep)
@@ -237,17 +279,25 @@ def pretrain(
             module.p = dropout
 
     # ------ Prepare the data ------
-    synonyms = load_umls(
-        umls_path,
-        query=query,
-        cui_query=cui_query,
-    )
+    if umls_path is not None:
+        synonyms = load_umls(
+            umls_path,
+            query=query,
+            cui_query=cui_query,
+        )
+    else:
+        synonyms = load_wiki(
+            wiki_path,
+            query=query,
+            cui_query=cui_query,
+            sample=sample,
+        )
     if debug:
         max_steps = 500
-        synonyms = synonyms.limit(10000).collect().lazy()
+        synonyms = synonyms.limit(1000).collect().lazy()
 
     # Preprocessing training data
-    print("Preprocessing data")
+    print("Preprocessing synonyms")
     nlp.to(device)
     nlp.post_init(
         edsnlp.data.from_polars(
@@ -267,6 +317,9 @@ def pretrain(
     print("- Groups:", len(linker.span_labels_to_idx))
     print("- Concepts:", len(linker.concepts_to_idx))
     print("- Synonyms:", len(prep))
+    assert len(linker.span_labels_to_idx) > 0
+    assert len(linker.concepts_to_idx) > 0
+    assert len(prep) > 0
 
     # Optimizer
     params = set(linker.parameters())
@@ -275,33 +328,24 @@ def pretrain(
     batch_iterator = iter(make_batches(prep, nlp, batch_size, device))
 
     optim = ScheduledOptimizer(
-        torch.optim.AdamW(
-            [
-                {
-                    "params": list(params - trf_params),
-                    "lr": task_lr,
-                    "schedules": LinearSchedule(
-                        total_steps=max_steps,
-                        warmup_rate=warmup_rate,
-                        start_value=task_lr,
-                    ),
-                }
-            ]
-            + [
-                {
-                    "params": list(trf_params),
-                    "lr": transformer_lr,
-                    "schedules": LinearSchedule(
-                        total_steps=max_steps,
-                        warmup_rate=warmup_rate,
-                        start_value=0,
-                    ),
-                },
-            ][: 1 if transformer_lr else 0]
-        )
+        optim=torch.optim.AdamW,
+        module=nlp,
+        total_steps=max_steps,
+        groups={
+            "bias|norm(|_1|_2)[.]weight|(embedding|classifier)[.]weight": {
+                "weight_decay": 0,
+            },
+            "linker[.]embedding[.]embedding": {
+                "lr": {"@schedules": "linear", "warmup_rate": warmup_rate, "start_value": 0, "max_value": transformer_lr,},
+            } if transformer_lr > 0 else False,
+            "": {
+                "lr": {"@schedules": "linear", "warmup_rate": warmup_rate, "start_value": task_lr, "max_value": task_lr,},
+            },
+        },
     )
     all_params = set(nlp.parameters())
     grad_params = {p for group in optim.param_groups for p in group["params"]}
+    print(optim)
     print(
         "Optimizing:"
         + "".join(
@@ -310,6 +354,7 @@ def pretrain(
             for group in optim.param_groups
         )
     )
+    optim.initialize()
     print(f"Not optimizing {len(all_params - grad_params)} params")
     for param in all_params - grad_params:
         param.requires_grad_(False)
@@ -324,6 +369,7 @@ def pretrain(
 
     # Training loop - step 1
     validation_interval = validation_interval or max_steps // 10
+    count = 0
     for step in trange(
         max_steps + 1,
         desc="Training model",
@@ -338,39 +384,43 @@ def pretrain(
                         "lr": optim.param_groups[0]["lr"],
                         "rescale": float(linker.classifier.rescale or 1.0),
                         "bias": float(linker.classifier.bias or 0.0),
-                        **cumulated_data,
-                        **evaluate_model(nlp, val_docs),
+                        **{k: v / max(1, count) for k, v in cumulated_data.items()},
+                        **(evaluate_model(nlp, val_docs) if val_docs is not None else {}),
                     }
                 )
                 cumulated_data.clear()
                 logger.log_metrics(flatten_dict(all_metrics[-1]))
                 nlp.to_disk(output_dir)
                 train_metrics_path.write_text(json.dumps(all_metrics, indent=2))
+                count = 0
 
         if step == max_steps:
             break
 
-        optim.zero_grad()
-        mini_batch = next(batch_iterator)
-        mini_batch = send_to_device(mini_batch, device)
-        loss = torch.zeros((), device=device)
-        with nlp.cache(), torch.cuda.amp.autocast():
-            res = dict(linker.module_forward(mini_batch["linker"]))
-            if "loss" in res:
-                loss += res["loss"]
-            for key, value in res.items():
-                if key.endswith("loss"):
-                    cumulated_data[key] += float(value)
-            if torch.isnan(loss):
-                raise ValueError("NaN loss")
+        with SliceContext(optim) as slice_context:
+            optim.zero_grad()
+            mini_batch = next(batch_iterator)
+            mini_batch = send_to_device(mini_batch, device)
+            loss = torch.zeros((), device=device)
+            count += 1
 
-            scaler.scale(loss).backward()
-            del loss, res, key, value, mini_batch
+            with nlp.cache(), torch.cuda.amp.autocast():
+                res = dict(linker.module_forward(mini_batch["linker"]))
+                if "loss" in res:
+                    loss += res["loss"]
+                for key, value in res.items():
+                    if isinstance(value, (float, int)) or isinstance(value, torch.Tensor) and value.numel() == 1:
+                        cumulated_data[key] += float(value)
+                if torch.isnan(loss):
+                    raise ValueError("NaN loss")
 
-        if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(grad_params, max_grad_norm)
-        scaler.step(optim)
-        scaler.update()
+                scaler.scale(loss).backward()
+                del loss, res, key, value, mini_batch
+
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(grad_params, max_grad_norm)
+            scaler.step(optim)
+            scaler.update()
 
 
 # noinspection PyTypeHints
@@ -386,7 +436,8 @@ def train_classifier(
     training_top_k: int = 200,
     validation_interval: Optional[int] = None,
     warmup_rate: float = 0.1,
-    umls_path: Path,
+    umls_path: Optional[Path] = None,
+    wiki_path: Optional[Path] = None,
     query: str,
     cui_query: Optional[str] = None,
     cpu: bool = False,
@@ -432,6 +483,8 @@ def train_classifier(
         - MRCONSO.RRF
         - MRSTY.RRF
         - sty_groups.tsv
+    wiki_path : Path
+        The path to the Wikipedia synonyms data.
     query : str
         The polars query to filter the UMLS synonyms.
     cui_query : Optional[str]
@@ -497,11 +550,18 @@ def train_classifier(
     nlp.to(device).train(False)
 
     # ------ Prepare the data ------
-    synonyms = load_umls(
-        umls_path,
-        query=query,
-        cui_query=cui_query,
-    )
+    if umls_path is not None:
+        synonyms = load_umls(
+            umls_path,
+            query=query,
+            cui_query=cui_query,
+        )
+    else:
+        synonyms = load_wiki(
+            wiki_path,
+            query=query,
+            cui_query=cui_query,
+        )
     if debug:
         max_steps = 500
         synonyms = synonyms.limit(10000).collect().lazy()
@@ -601,28 +661,32 @@ def train_classifier(
     del all_embeds, all_labels_indices, all_concepts_indices, all_hard_negatives
 
     optim = ScheduledOptimizer(
-        torch.optim.AdamW(
-            [
-                {
-                    "params": [linker.classifier.weight],
-                    "lr": task_lr,
-                    "schedules": LinearSchedule(
-                        total_steps=max(1, max_steps),
-                        warmup_rate=warmup_rate,
-                        start_value=task_lr,
-                    ),
-                }
-            ]
-        )
+        optim=torch.optim.AdamW,
+        module=nlp,
+        total_steps=max_steps,
+        groups={
+            "bias|norm(|_1|_2)[.]weight|(embedding|classifier)[.]weight": {
+                "weight_decay": 0,
+            },
+            "linker[.]embedding[.]": False,
+            "": {
+                "lr": {"@schedules": "linear", "warmup_rate": warmup_rate, "start_value": task_lr, "max_value": task_lr,},
+            },
+        },
     )
     all_params = set(nlp.parameters())
     grad_params = {p for group in optim.param_groups for p in group["params"]}
     print(
-        "Optimizing:"
+        "Optimizing groups:"
         + "".join(
-            f"\n - {len(group['params'])} params "
-            f"({sum(p.numel() for p in group['params'])} total)"
-            for group in optim.param_groups
+            "\n - {} weight tensors ({:,} parameters){}".format(
+                len([p for p in g["params"] if p in grad_params]),
+                sum([p.numel() for p in g["params"] if p in grad_params]),
+                ": " + " & ".join(g.get("selectors", "*"))
+                if "selectors" in g
+                else "",
+            )
+            for g in optim.param_groups
         )
     )
     print(f"Not optimizing {len(all_params - grad_params)} params")
@@ -651,7 +715,7 @@ def train_classifier(
                         "rescale": float(linker.classifier.rescale or 1.0),
                         "bias": float(linker.classifier.bias or 0.0),
                         **cumulated_data,
-                        **evaluate_model(nlp, val_docs),
+                        **(evaluate_model(nlp, val_docs) if val_docs is not None else {}),
                     }
                 )
             cumulated_data.clear()
